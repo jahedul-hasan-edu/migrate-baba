@@ -11,6 +11,9 @@ use mb_core::model::{Catalog, QName};
 use mb_core::progress::{CancellationToken, Level};
 
 use crate::app::{App, Event, Loaded};
+
+const REFRESH_MS: u64 = 2000;
+const DATA_MS: u64 = 3000;
 use crate::theme::{self, Pal};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -84,6 +87,13 @@ impl CompareView {
             .map(|t| DataRow { table: t.name.clone(), checked: true, est_rows: t.est_rows, result: None, running: false })
             .collect();
         self.rows.sort_by(|a, b| a.table.cmp(&b.table));
+    }
+
+    /// Cancel a running data compare (e.g. when leaving the job).
+    pub fn stop(&mut self) {
+        if let Some(c) = &self.cancel {
+            c.cancel();
+        }
     }
 
     pub fn on_data_started(&mut self, t: QName) {
@@ -163,10 +173,15 @@ impl CompareView {
 }
 
 impl App {
-    pub fn compare_actions(&mut self, ui: &mut egui::Ui) {
+    fn compare_actions(&mut self, ui: &mut egui::Ui) {
+        if self.compare_problem().is_some() {
+            return;
+        }
+        let loading = self.cat_loading();
         match self.compare.tab {
             Tab::Schema => {
-                if theme::primary(ui, !self.cat_loading, if self.cat_loading { "Reading…" } else { "Refresh" }).clicked() {
+                let can = !loading && !self.cooling("refresh", REFRESH_MS);
+                if theme::primary(ui, can, if loading { "Reading…" } else { "Refresh" }).clicked() {
                     self.load_catalogs();
                 }
             }
@@ -179,7 +194,8 @@ impl App {
                     }
                 } else {
                     let n = self.compare.rows.iter().filter(|r| r.checked).count();
-                    if theme::primary(ui, n > 0 && !self.cat_loading, &format!("Compare data ({n})")).clicked() {
+                    let can = n > 0 && !loading && self.cat.is_some() && !self.cooling("data_compare", DATA_MS);
+                    if theme::primary(ui, can, &format!("Compare data ({n})")).clicked() {
                         self.start_data_compare();
                     }
                 }
@@ -187,7 +203,27 @@ impl App {
         }
     }
 
+    fn compare_left(&mut self, ui: &mut egui::Ui) {
+        let p = theme::pal(ui);
+        let mut tab = self.compare.tab;
+        if theme::segmented(ui, &mut tab, &[(Tab::Schema, "Schema"), (Tab::Data, "Data")]) {
+            self.compare.tab = tab;
+        }
+        ui.add_space(8.0);
+        if self.compare.tab == Tab::Schema && !self.compare.diffs.is_empty() && self.cat.is_some() {
+            let s = mb_core::diff::summarize(&self.compare.diffs);
+            theme::chip(ui, &format!("+{} new", s.added), p.green);
+            theme::chip(ui, &format!("~{} changed", s.changed), p.amber);
+            theme::chip(ui, &format!("−{} only in target", s.removed), p.red);
+            theme::muted(ui, format!("{} identical", s.identical));
+        }
+    }
+
     fn start_data_compare(&mut self) {
+        if self.compare.data_running || self.cooling("data_compare", DATA_MS) {
+            return;
+        }
+        self.mark("data_compare");
         let Some((s, t)) = self.compare.catalogs.clone() else { return };
         let job = self.job().clone();
         let (Some(src), Some(tgt)) = (self.params(&job.source_id), self.params(&job.target_id)) else { return };
@@ -214,31 +250,20 @@ impl App {
     }
 
     pub fn ui_compare(&mut self, ui: &mut egui::Ui) {
-        let p = theme::pal(ui);
-        ui.horizontal(|ui| {
-            let mut tab = self.compare.tab;
-            if theme::segmented(ui, &mut tab, &[(Tab::Schema, "Schema"), (Tab::Data, "Data")]) {
-                self.compare.tab = tab;
-            }
-            ui.add_space(8.0);
-            if self.compare.tab == Tab::Schema && !self.compare.diffs.is_empty() {
-                let s = mb_core::diff::summarize(&self.compare.diffs);
-                theme::chip(ui, &format!("+{} new", s.added), p.green);
-                theme::chip(ui, &format!("~{} changed", s.changed), p.amber);
-                theme::chip(ui, &format!("−{} only in target", s.removed), p.red);
-                theme::muted(ui, format!("{} identical", s.identical));
-            }
-        });
-        ui.add_space(14.0);
-        if self.cat_loading && self.cat.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                theme::muted(ui, "Reading both databases…");
-            });
+        self.screen_header(ui, |a, ui| a.compare_left(ui), |a, ui| a.compare_actions(ui));
+        if let Some(problem) = self.compare_problem() {
+            theme::empty_state(ui, &problem, "Compare reads both databases — nothing is changed.");
             return;
         }
         if self.cat.is_none() {
-            theme::empty_state(ui, "Nothing loaded", "Press Refresh to read both databases.");
+            if self.cat_loading() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    theme::muted(ui, "Reading both databases…");
+                });
+            } else {
+                theme::empty_state(ui, "Nothing loaded", "Press Refresh to read both databases.");
+            }
             return;
         }
         match self.compare.tab {

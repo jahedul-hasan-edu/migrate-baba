@@ -21,6 +21,9 @@ use crate::store::{DataSpec, PauseReason, RunState, RunStatus};
 use crate::theme::{self, Pal};
 use crate::views::compare::status_color;
 
+/// Each worker holds a session on both servers; past this it only adds load.
+const MAX_WORKERS: usize = 16;
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
@@ -160,7 +163,16 @@ impl App {
         }
     }
 
-    pub fn migration_actions(&mut self, ui: &mut egui::Ui) {
+    /// Migration needs a clean Doctor run for this exact pair (an existing data run stays reachable).
+    fn migration_gated(&self) -> bool {
+        let has_run = self.entry().run.is_some() || self.entry().starting.is_some();
+        !self.doctor_passed() && !(self.migration.tab == Tab::Data && has_run)
+    }
+
+    fn migration_actions(&mut self, ui: &mut egui::Ui) {
+        if self.migration_gated() {
+            return;
+        }
         match self.migration.tab {
             Tab::Data => {
                 let e = self.entry();
@@ -189,7 +201,7 @@ impl App {
                     }
                     _ => {
                         let n = self.migration.rows.iter().filter(|r| r.checked).count();
-                        if theme::primary(ui, n > 0 && !self.cat_loading, "Run Migration").clicked() {
+                        if theme::primary(ui, n > 0 && !self.cat_loading(), "Run Migration").clicked() {
                             self.migration.confirm = Some(RunConfirm { text: String::new() });
                         }
                     }
@@ -197,7 +209,8 @@ impl App {
             }
             Tab::Schema => {
                 self.refresh_plan();
-                let has = !self.migration.plan.steps.is_empty();
+                // A plan built from a read that's being replaced could be stale.
+                let has = !self.migration.plan.steps.is_empty() && !self.cat_loading() && self.cat.is_some();
                 let loss = self.migration.plan.has_data_loss();
                 let deploy = if loss { theme::danger(ui, has, "Deploy") } else { theme::primary(ui, has, "Deploy") };
                 if deploy.clicked() {
@@ -235,13 +248,23 @@ impl App {
     }
 
     pub fn ui_migration(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let mut tab = self.migration.tab;
+        let left = |a: &mut Self, ui: &mut egui::Ui| {
+            let mut tab = a.migration.tab;
             if theme::segmented(ui, &mut tab, &[(Tab::Data, "Data"), (Tab::Schema, "Schema")]) {
-                self.migration.tab = tab;
+                a.migration.tab = tab;
             }
-        });
-        ui.add_space(16.0);
+        };
+        self.screen_header(ui, left, |a, ui| a.migration_actions(ui));
+        if let Some(problem) = self.pair_problem() {
+            if self.entry().run.is_none() {
+                theme::empty_state(ui, problem, "Pick where to copy from and to above.");
+                return;
+            }
+        }
+        if self.migration_gated() {
+            self.doctor_gate(ui);
+            return;
+        }
         match self.migration.tab {
             Tab::Data => {
                 let show_run = self.entry().run.is_some() || self.entry().starting.is_some();
@@ -255,12 +278,42 @@ impl App {
         }
     }
 
+    /// Shown instead of the migration tools until Doctor clears this pair.
+    fn doctor_gate(&mut self, ui: &mut egui::Ui) {
+        let p = theme::pal(ui);
+        let rec = self.job().doctor.clone().filter(|d| d.sig == self.signature());
+        let (title, sub, color) = match &rec {
+            Some(r) if r.blocked() => ("Doctor found blockers", "Fix them, then re-check — Migration unlocks right after.", p.red),
+            _ if self.doctor.running => ("Doctor is checking this pair…", "Migration unlocks as soon as it passes.", p.accent),
+            _ => ("Run Doctor for this pair first", "It checks access, versions and permissions so a migration can't fail halfway.", p.amber),
+        };
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(520.0);
+            theme::card(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        theme::dot(ui, color);
+                        ui.label(theme::title(title));
+                    });
+                    theme::muted(ui, sub);
+                    ui.add_space(10.0);
+                    if self.doctor.running {
+                        ui.spinner();
+                    } else if theme::primary(ui, true, if rec.is_some() { "Open Doctor" } else { "Run Doctor" }).clicked() {
+                        self.go(crate::app::Screen::Doctor);
+                    }
+                });
+            });
+        });
+    }
+
     // ---- data: setup ----------------------------------------------------------------------------
 
     fn data_setup(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
         if self.migration.rows.is_empty() {
-            if self.cat_loading {
+            if self.cat_loading() {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     theme::muted(ui, "Reading tables…");
@@ -299,11 +352,11 @@ impl App {
                     ui.checkbox(&mut spec.analyze, "Analyze after");
                 });
                 ui.add_space(6.0);
-                if ui.small_button("+").clicked() {
-                    spec.workers = (spec.workers + 1).min(32);
+                if ui.add_enabled(spec.workers < MAX_WORKERS, egui::Button::new("+").small()).clicked() {
+                    spec.workers = (spec.workers + 1).min(MAX_WORKERS);
                 }
                 ui.label(theme::strong(spec.workers.to_string()));
-                if ui.small_button("−").clicked() {
+                if ui.add_enabled(spec.workers > 1, egui::Button::new("−").small()).clicked() {
                     spec.workers = spec.workers.saturating_sub(1).max(1);
                 }
                 theme::muted(ui, "Workers");
@@ -371,7 +424,11 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        if self.entry().running() || self.migration_gated() {
+            return;
+        }
         let mut spec = self.migration.spec.clone();
+        spec.workers = spec.workers.clamp(1, MAX_WORKERS);
         spec.tables = self.migration.rows.iter().filter(|r| r.checked).map(|r| r.table.clone()).collect();
         self.job_mut().data = spec;
         self.save_job();
@@ -548,7 +605,7 @@ impl App {
     fn schema_migration(&mut self, ui: &mut egui::Ui) {
         self.refresh_plan();
         let p = theme::pal(ui);
-        if self.cat_loading && self.migration.catalogs.is_none() {
+        if self.cat_loading() && self.migration.catalogs.is_none() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 theme::muted(ui, "Reading both databases…");
@@ -650,6 +707,9 @@ impl App {
     }
 
     fn open_deploy(&mut self, test: bool) {
+        if self.migration.deploying() || self.migration.plan.steps.is_empty() {
+            return;
+        }
         let plan = self.migration.plan.clone();
         self.migration.deploy = Some(DeployState {
             test,
@@ -663,6 +723,9 @@ impl App {
     }
 
     fn run_deploy(&mut self) {
+        if self.migration.deploying() {
+            return;
+        }
         let Some(target) = self.params(&self.job().target_id.clone()) else { return };
         let filter = self.schema_filter();
         let ignore_comments = self.settings.ignore_comments;

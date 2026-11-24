@@ -304,25 +304,20 @@ pub fn ghost(ui: &mut Ui, text: &str) -> Response {
     ui.add(egui::Button::new(RichText::new(text).color(c)).frame(false))
 }
 
-/// Full-width secondary button (e.g. "Test Connection").
-pub fn wide(ui: &mut Ui, enabled: bool, text: &str) -> Response {
-    let w = ui.available_width();
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(strong(text)).corner_radius(CornerRadius::same(8)).min_size(egui::vec2(w, 40.0)),
-    )
-}
-
 pub fn field_label(ui: &mut Ui, t: &str) {
     let c = pal(ui).muted;
     ui.label(strong(t).color(c));
 }
+
+/// Hard cap on any typed value: nothing in a connection or filter needs more.
+pub const MAX_INPUT: usize = 256;
 
 /// Single-line input in the screenshot style (tall, roomy padding).
 pub fn input(ui: &mut Ui, value: &mut String, hint: &str, width: f32) -> Response {
     ui.add(
         egui::TextEdit::singleline(value)
             .hint_text(hint)
+            .char_limit(MAX_INPUT)
             .margin(Margin::symmetric(12, 9))
             .min_size(egui::vec2(width, 40.0))
             .desired_width(width),
@@ -333,6 +328,7 @@ pub fn password(ui: &mut Ui, value: &mut String, width: f32) -> Response {
     ui.add(
         egui::TextEdit::singleline(value)
             .password(true)
+            .char_limit(MAX_INPUT)
             .hint_text("Not set")
             .margin(Margin::symmetric(12, 9))
             .min_size(egui::vec2(width, 40.0))

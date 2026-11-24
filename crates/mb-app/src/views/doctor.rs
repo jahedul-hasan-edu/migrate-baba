@@ -1,4 +1,5 @@
-//! Doctor: pre-flight checks for the job's pair. Blockers lock Compare and Migration until fixed.
+//! Doctor: pre-flight checks for the job's pair. Blockers lock Migration until fixed; Compare is
+//! read-only and never waits on Doctor.
 
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use mb_core::doctor::{diagnose, DoctorInput, Finding, Severity};
@@ -7,6 +8,9 @@ use mb_core::progress::Level;
 use crate::app::{App, Event, Screen};
 use crate::store::{now_ms, DoctorRecord};
 use crate::theme;
+
+/// Doctor opens several sessions on both servers; don't let it be hammered.
+const RECHECK_MS: u64 = 4000;
 
 #[derive(Default)]
 pub struct DoctorView {
@@ -20,9 +24,10 @@ fn block(title: impl Into<String>, detail: impl Into<String>, fix: &str) -> Find
 
 impl App {
     pub fn run_doctor(&mut self) {
-        if self.doctor.running || self.pair_problem().is_some() {
+        if self.doctor.running || self.pair_problem().is_some() || self.cooling("doctor", RECHECK_MS) {
             return;
         }
+        self.mark("doctor");
         let job = self.job().clone();
         let (Some(sp), Some(tp)) = (self.profile(&job.source_id).cloned(), self.profile(&job.target_id).cloned()) else { return };
         let sig = self.signature();
@@ -73,68 +78,81 @@ impl App {
                 self.notify(Level::Warn, "Fix the blockers, then re-check");
             } else {
                 self.notify(Level::Info, "Ready to migrate");
+                if self.screen == Screen::Migration {
+                    self.ensure_catalogs();
+                }
             }
         }
     }
 
-    pub fn doctor_actions(&mut self, ui: &mut egui::Ui) {
-        let passed = self.doctor_passed();
-        if passed {
-            if theme::primary(ui, true, "Continue  →").clicked() {
-                self.go(Screen::Compare);
+    fn doctor_actions(&mut self, ui: &mut egui::Ui) {
+        if self.pair_problem().is_some() {
+            return;
+        }
+        let can = !self.doctor.running && !self.cooling("doctor", RECHECK_MS);
+        if self.doctor_passed() {
+            if theme::primary(ui, true, "Continue to Migration  →").clicked() {
+                self.go(Screen::Migration);
             }
-            if theme::secondary(ui, !self.doctor.running, "Re-check").clicked() {
+            if theme::secondary(ui, can, "Re-check").clicked() {
                 self.run_doctor();
             }
         } else {
             let label = if self.job().doctor.is_some() { "Re-check" } else { "Run Doctor" };
-            if theme::primary(ui, !self.doctor.running && self.pair_problem().is_none(), label).clicked() {
+            if theme::primary(ui, can, label).clicked() {
                 self.run_doctor();
+            }
+        }
+    }
+
+    fn doctor_status(&mut self, ui: &mut egui::Ui) {
+        let p = theme::pal(ui);
+        if self.pair_problem().is_some() {
+            ui.label(theme::title("Doctor"));
+            return;
+        }
+        if self.doctor.running {
+            ui.spinner();
+            ui.label(theme::title("Checking…"));
+            return;
+        }
+        match self.job().doctor.clone() {
+            None => {
+                ui.label(theme::title("Not checked yet"));
+            }
+            Some(r) if r.sig != self.signature() => {
+                theme::dot(ui, p.amber);
+                ui.label(theme::title("Connections changed — re-check"));
+            }
+            Some(r) => {
+                let blocks = r.findings.iter().filter(|f| f.severity == Severity::Block).count();
+                let warns = r.findings.iter().filter(|f| f.severity == Severity::Warn).count();
+                if blocks > 0 {
+                    theme::dot(ui, p.red);
+                    ui.label(theme::title(format!("{blocks} blocker{} to fix", if blocks == 1 { "" } else { "s" })));
+                } else {
+                    theme::dot(ui, p.green);
+                    ui.label(theme::title("Ready to migrate"));
+                }
+                let mut sub = theme::fmt_ago(r.at);
+                if warns > 0 {
+                    sub = format!("{warns} warning{} · {sub}", if warns == 1 { "" } else { "s" });
+                }
+                theme::muted(ui, sub);
             }
         }
     }
 
     pub fn ui_doctor(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
-        let sig = self.signature();
+        self.screen_header(ui, |a, ui| a.doctor_status(ui), |a, ui| a.doctor_actions(ui));
+        if let Some(problem) = self.pair_problem() {
+            theme::empty_state(ui, problem, "Doctor checks the source and target you pick above.");
+            return;
+        }
         let record = self.job().doctor.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(860.0);
-            // Status line.
-            ui.horizontal(|ui| {
-                if self.doctor.running {
-                    ui.spinner();
-                    ui.label(theme::heading("Checking…"));
-                    return;
-                }
-                match &record {
-                    None => {
-                        ui.label(theme::heading("Not checked yet"));
-                    }
-                    Some(r) if r.sig != sig => {
-                        theme::dot(ui, p.amber);
-                        ui.label(theme::heading("Connections changed"));
-                    }
-                    Some(r) => {
-                        let blocks = r.findings.iter().filter(|f| f.severity == Severity::Block).count();
-                        let warns = r.findings.iter().filter(|f| f.severity == Severity::Warn).count();
-                        if blocks > 0 {
-                            theme::dot(ui, p.red);
-                            ui.label(theme::heading(format!("{blocks} blocker{} to fix", if blocks == 1 { "" } else { "s" })));
-                        } else {
-                            theme::dot(ui, p.green);
-                            ui.label(theme::heading("Ready to migrate"));
-                        }
-                        let mut sub = theme::fmt_ago(r.at);
-                        if warns > 0 {
-                            sub = format!("{warns} warning{} · {sub}", if warns == 1 { "" } else { "s" });
-                        }
-                        theme::muted(ui, sub);
-                    }
-                }
-            });
-            ui.add_space(14.0);
-
             let Some(r) = record else {
                 theme::muted(ui, "Doctor checks access, versions, extensions and permissions on both databases.");
                 return;
