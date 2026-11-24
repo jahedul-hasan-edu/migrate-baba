@@ -1,21 +1,22 @@
-# Migrate Baba
+# Ferry (Migrate Baba)
 
-Native Rust desktop app (Windows / macOS / Linux) to **compare, diff and migrate PostgreSQL databases** —
+Native Rust desktop app (Windows / macOS / Linux) to **check, compare and migrate PostgreSQL databases** —
 Supabase, Neon, AWS RDS/Aurora, Cloud SQL, Azure, DigitalOcean, Render, Railway, Crunchy Bridge, Timescale,
-self-hosted (PostgreSQL 12+).
+self-hosted (PostgreSQL 12+). MySQL and SQL Server connections can be saved and reachability-tested; migrating
+them is not implemented yet, and Doctor blocks such pairs.
 
-* **Schema Compare** — tables, columns, constraints, indexes, triggers, RLS policies, views & materialized
-  views, functions/procedures (Supabase RPC), enums/domains/composite types, sequences, extensions, schemas,
-  comments. Side-by-side DDL diff, per-object selection, dependency-ordered script with hazard annotations,
-  **test deploy** (transaction + rollback) and deploy with stale-compare guard.
-* **Data Compare** — server-side chunk hashing (only hashes cross the network), row-level drill-down,
-  sync (upsert + delete via staging table).
-* **Migrate Data** — parallel binary `COPY` streaming, exported snapshot for consistency, ctid splitting of
-  big tables (PG14+), FK-ordered waves when triggers can't be disabled, sequence reset, ANALYZE.
-* Passwords in the OS keychain; history of every deploy/copy/sync.
+* **Connections** — saved local/cloud connections, picked per job as *Source* and *Target*. Passwords live in
+  the OS keychain.
+* **Doctor** — pre-flight checks (reachability, versions, read/write/CREATE privileges, extensions, encodings,
+  connection headroom, resume support) with copyable fixes. Blockers lock Compare and Migration.
+* **Compare** — schema objects side by side, and chunk-hashed table data (only hashes cross the network).
+* **Migration** — *Data*: parallel binary `COPY` in a background process that keeps running when the window
+  closes, checkpoints every committed chunk, and pauses (never fails) on obstacles with a hint on what to fix.
+  *Schema*: tables, views, functions, procedures, triggers, types — dependency-ordered script, test deploy,
+  single-transaction deploy with a stale-target guard.
 * `mbaba` CLI for CI (exit code 2 = drift found).
 
-Specs live in [`docs/specs/`](docs/specs/00-overview.md).
+Specs live in [`docs/specs/`](docs/specs/00-overview.md) (written for the earlier screen layout).
 
 ## Layout
 
@@ -42,96 +43,63 @@ cargo test -p mb-core                # unit + planner tests
 
 ## How to use
 
-> Screenshots show each screen before any database is connected.
+The sidebar walks through four steps; each unlocks the next. A **job** (sidebar → *Jobs*, `+` for a new one)
+is one Source → Target pair with its own checks and runs. `Ctrl+1…4` jump between steps.
 
-The workflow is always: **connect → pick Source and Target → compare → review → apply**.
-*Source* is the database that already looks the way you want; *Target* is the one that will be changed.
+### 1. Connections
 
-### 1. Add your connections
+![Connections](docs/screenshots/connections.png)
 
-![Connections screen](docs/screenshots/connections.png)
+Pick the engine, then a saved connection or **＋ New connection**, for both Source (the database that already
+looks right) and Target (the one that changes). Fields save themselves when you leave them; **Test Connection**
+checks the server. *More options* holds the name, provider preset (sets SSL and skipped schemas, e.g. Supabase's
+managed schemas), SSL mode, a paste-a-URL field and the *Production* flag (writes then ask you to type the
+database name). Right-click a connection in the sidebar to use it as source/target or delete it.
 
-1. Open **Connections** (`Ctrl+1`).
-2. Paste a connection URL into the top field and press **Fill from URL**, or fill in the form by hand.
-   - **Supabase:** choose the *Supabase* provider so its managed schemas (`auth`, `storage`, `realtime`, …)
-     are excluded. Use the direct connection (`db.<ref>.supabase.co:5432`) or the session pooler
-     (port `5432`), **not** the transaction pooler on port `6543`.
-   - Most cloud providers need **SSL mode** `require`.
-3. Press **Test connection**. It shows the server version, round-trip latency and whether the user can
-   disable triggers for fast loads.
-4. Press **Save**. The password goes to the Windows Credential Manager / macOS Keychain, never to disk.
-   Tick **Production** on live databases to get extra confirmation before any write.
-5. Press **Use as source** / **Use as target**, or pick them in the top bar. **⇄** swaps them.
+### 2. Doctor
 
-Optional: type schema names into **Schemas** in the top bar (e.g. `public, app`) to limit everything to
-those schemas.
+![Doctor](docs/screenshots/doctor.png)
 
-### 2. Compare and migrate the schema
+Runs every pre-flight check. **Blockers** must be fixed before Compare and Migration unlock — most come with
+the exact `GRANT` to run. Warnings don't block. Changing either connection invalidates the result.
 
-![Schema Compare screen](docs/screenshots/schema-compare.png)
+### 3. Compare
 
-1. Open **Schema Compare** (`Ctrl+2`) and press **Compare** (`F5`).
-2. The left list groups objects into **To create** (only in source), **To alter** (different) and
-   **To drop** (only in target). Use the search box, the kind filter and **Show identical** to narrow it.
-3. Click an object to see its definition in both databases **side by side** (green = added, red = removed,
-   amber = changed). The **Changes** tab lists each difference in plain words.
-4. Untick anything you don't want to apply. The **Script** tab shows the exact SQL for your selection, in
-   dependency order, with risky statements labelled `DATA LOSS`, `REWRITE`, `MAY FAIL`, `LOCKS` or `MANUAL`.
-5. Press **Test deploy** first: it runs the whole script inside a transaction and rolls it back, so you find
-   errors without changing anything.
-6. Press **Deploy…** to apply it. Scripts that can lose data, or targets tagged Production, ask you to
-   type the database name. Afterwards the app re-compares automatically; the list should be empty.
-   You can also **Copy SQL**, **Save .sql…**, or **Save as migration…** (timestamped file that works with
-   the Supabase CLI) instead of deploying from the app.
+*Schema*: objects grouped into new / changed / only-in-target with a side-by-side definition diff.
+*Data*: per-table row counts and missing / extra / changed rows.
 
-`Options ▾` controls ignoring comments, `CASCADE` on drops and building indexes `CONCURRENTLY`.
+### 4. Migration
 
-### 3. Compare data
+![Migration](docs/screenshots/migration.png)
 
-![Data Compare screen](docs/screenshots/data-compare.png)
+**Data** — pick tables and a mode (*Replace* empties target tables first, *Append* only inserts, *Sync* upserts
+and deletes; needs a primary key), then **Run Migration**.
 
-1. Open **Data Compare** (`Ctrl+3`), press **Load tables** (`F5`), tick the tables to check.
-2. Press **Compare data**. Each table shows source/target row counts and how many rows exist only in the
-   source, only in the target, or differ. Click a row to see sample keys.
-3. **Sync to target…** makes the selected tables match the source: it inserts, updates and deletes only
-   the rows in chunks that differ.
+- The copy runs in a separate background process, so closing Ferry doesn't stop it; reopen Ferry to see live
+  progress. The computer is kept awake while it runs (Windows).
+- **Pause** / **Resume** at any time. If the app, the worker or the computer stops mid-run, the job shows
+  *Interrupted* and **Resume** continues from the last committed chunk.
+- Any obstacle (lost connection, permissions, duplicate keys, full disk…) pauses the run and says what to fix.
+  Fix it, then **Resume**.
+- Exact resume uses a small marker table in schema `_mbaba` on the target, written in the same transaction as
+  each chunk and removed when the job finishes or is discarded. Without `CREATE` rights resume still works from
+  the local checkpoint (Doctor warns that a crash mid-chunk may re-copy that chunk).
 
-**Chunk** sets how many rows are hashed per round trip (default 10 000).
+**Schema** — tick the objects to apply, review the generated script and hazard labels, **Test** (runs in a
+transaction and rolls back), then **Deploy**.
 
-### 4. Copy data
+### Data on disk
 
-![Migrate Data screen](docs/screenshots/migrate-data.png)
-
-1. Open **Migrate Data** (`Ctrl+4`) and press **Load tables** (`F5`). Tables missing on the target are
-   marked **new**.
-2. Choose a **Mode**:
-   - **Replace**: empties the selected target tables, then copies everything.
-   - **Append**: only inserts rows.
-   - **Sync**: upserts and deletes so tables match. Needs a primary key.
-3. Adjust **Workers** (parallel connections) and options. *Create missing tables* builds absent tables
-   from the source schema first. *Consistent snapshot* copies all tables as of the same moment.
-4. Press **Start migration** and confirm. Per-table progress, overall MB/s and ETA update live; **Cancel**
-   stops cleanly.
-
-### 5. History and settings
-
-![History screen](docs/screenshots/history.png)
-
-Every deploy, data copy and sync is stored in **History** (`Ctrl+5`) with its script, outcome and log.
-
-![Settings screen](docs/screenshots/settings.png)
-
-**Settings** (`Ctrl+6`) controls the theme, UI scale, default workers, data-compare chunk size, the deploy
-`lock_timeout` and schema-compare defaults.
+Connections and settings live in the user config folder, jobs in `<data>/jobs/<id>/` (`job.json`, `run.json`
+with progress + checkpoint, `log.txt`). Set `FERRY_HOME` to keep everything in one folder instead.
 
 ### Troubleshooting
 
-- **App closes immediately on start:** a graphics-driver problem. In PowerShell, run
-  `$env:WGPU_BACKEND="gl"` and then start the app from that same window.
-- **"target schema changed since the last compare":** someone changed the target; press Compare again.
-- **Loads are slow / FK errors during copy:** the target user can't disable triggers (non-superuser, as on
-  Supabase), so tables load in foreign-key order. That's expected.
-- The **Log ▴** button in the bottom-right corner shows every action and full error details.
+- **App closes immediately on start:** Ferry renders with OpenGL on Windows and relaunches itself on DX12 if that
+  fails. To force one, set `$env:WGPU_BACKEND="dx12"` (or `"gl"`) and start the app from that window.
+- **"The target changed since it was read":** someone changed the target; press Refresh in Compare.
+- **Slow loads / FK errors:** the target user can't pause triggers (non-superuser, e.g. Supabase), so tables load
+  in foreign-key order. Doctor reports this as *Foreign-key ordered load*.
 
 ## CLI examples
 

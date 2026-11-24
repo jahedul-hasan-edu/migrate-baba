@@ -39,6 +39,68 @@ impl SslMode {
     }
 }
 
+/// Database engine of a connection.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Engine {
+    #[default]
+    Postgres,
+    MySql,
+    SqlServer,
+}
+
+impl Engine {
+    pub const ALL: [Engine; 3] = [Engine::Postgres, Engine::MySql, Engine::SqlServer];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Engine::Postgres => "PostgreSQL",
+            Engine::MySql => "MySQL",
+            Engine::SqlServer => "SQL Server",
+        }
+    }
+
+    /// Two-letter badge.
+    pub fn short(self) -> &'static str {
+        match self {
+            Engine::Postgres => "PG",
+            Engine::MySql => "MY",
+            Engine::SqlServer => "MS",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Engine::Postgres => 5432,
+            Engine::MySql => 3306,
+            Engine::SqlServer => 1433,
+        }
+    }
+
+    pub fn default_user(self) -> &'static str {
+        match self {
+            Engine::Postgres => "postgres",
+            Engine::MySql => "root",
+            Engine::SqlServer => "sa",
+        }
+    }
+
+    /// Whether schema/data migration is implemented for this engine.
+    pub fn migratable(self) -> bool {
+        self == Engine::Postgres
+    }
+}
+
+/// TCP reachability probe for engines without a bundled driver. Returns the connect time in ms.
+pub async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> Result<f64> {
+    let t0 = Instant::now();
+    let addr = format!("{host}:{port}");
+    match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(_)) => Ok(t0.elapsed().as_secs_f64() * 1000.0),
+        Ok(Err(e)) => Err(Error::Connect(format!("{addr}: {e}"))),
+        Err(_) => Err(Error::Connect(format!("{addr}: timed out"))),
+    }
+}
+
 /// Hosting provider presets. They only influence defaults (port, SSL, excluded schemas, hints).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Provider {

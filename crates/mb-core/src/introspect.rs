@@ -20,7 +20,7 @@ pub struct SchemaFilter {
 
 impl SchemaFilter {
     pub fn allows(&self, schema: &str) -> bool {
-        if self.exclude.iter().any(|s| s == schema) {
+        if schema == crate::data::copy::CHECKPOINT_SCHEMA || self.exclude.iter().any(|s| s == schema) {
             return false;
         }
         self.include.is_empty() || self.include.iter().any(|s| s == schema)

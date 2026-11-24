@@ -8,6 +8,7 @@ pub mod data;
 pub mod ddl;
 pub mod deploy;
 pub mod diff;
+pub mod doctor;
 pub mod error;
 pub mod ident;
 pub mod introspect;

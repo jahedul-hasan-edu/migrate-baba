@@ -1,7 +1,7 @@
 //! Parallel table copy: COPY TO STDOUT → COPY FROM STDIN streaming between servers.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,6 +16,29 @@ use crate::error::{Error, PgResultExt, Result};
 use crate::ident::quote_literal;
 use crate::model::{Catalog, QName};
 use crate::progress::{cancellable, CancellationToken, Level, LogFn};
+
+/// Schema on the target that holds resume markers while a resumable run is unfinished.
+pub const CHECKPOINT_SCHEMA: &str = "_mbaba";
+
+/// A ctid page range `[lo, hi)`; `hi = None` runs to the end. `(0, None)` is the whole table.
+pub type Part = (i64, Option<i64>);
+
+/// Durable progress of a resumable run, owned by the caller (e.g. a job file).
+pub trait Checkpoint: Send + Sync {
+    /// Parts planned for `table` by an earlier run; reused so ranges stay stable across resumes.
+    fn planned(&self, table: &QName) -> Option<Vec<Part>>;
+    fn plan(&self, table: &QName, parts: &[Part]);
+    /// Parts already committed on the target: `(index, rows, bytes)`.
+    fn done(&self, table: &QName) -> Vec<(u32, u64, u64)>;
+    fn mark_done(&self, table: &QName, part: u32, rows: u64, bytes: u64);
+}
+
+/// Resume context for [`run_with`].
+pub struct Resume<'a> {
+    /// Stable id of the job; used for the marker rows written on the target.
+    pub job_id: String,
+    pub store: &'a dyn Checkpoint,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CopyMode {
@@ -168,6 +191,8 @@ fn waves(jobs: &[TableJob]) -> Vec<Vec<usize>> {
 #[derive(Debug, Clone)]
 struct WorkItem {
     job: usize,
+    /// Index of this part within the table's plan.
+    part: u32,
     /// ctid page range [lo, hi)
     range: Option<(i64, Option<i64>)>,
     weight: i64,
@@ -179,7 +204,7 @@ fn split_items(job_idx: usize, job: &TableJob, opts: &CopyOptions, src_version: 
         && opts.split_threshold_pages > 0
         && job.pages > opts.split_threshold_pages;
     if !can_split {
-        return vec![WorkItem { job: job_idx, range: None, weight: job.pages }];
+        return vec![WorkItem { job: job_idx, part: 0, range: None, weight: job.pages }];
     }
     let parts = ((job.pages + opts.split_threshold_pages - 1) / opts.split_threshold_pages).min(opts.workers.max(1) as i64 * 2).max(2);
     let step = (job.pages + parts - 1) / parts;
@@ -187,9 +212,33 @@ fn split_items(job_idx: usize, job: &TableJob, opts: &CopyOptions, src_version: 
         .map(|p| {
             let lo = p * step;
             let hi = if p == parts - 1 { None } else { Some((p + 1) * step) };
-            WorkItem { job: job_idx, range: Some((lo, hi)), weight: step }
+            WorkItem { job: job_idx, part: p as u32, range: Some((lo, hi)), weight: step }
         })
         .collect()
+}
+
+/// Items for a job, reusing the plan of an earlier run when resuming.
+fn plan_items(job_idx: usize, job: &TableJob, opts: &CopyOptions, src_version: i32, resume: Option<&Resume<'_>>) -> Vec<WorkItem> {
+    if let Some(parts) = resume.and_then(|r| r.store.planned(&job.table)).filter(|p| !p.is_empty()) {
+        let w = (job.pages / parts.len() as i64).max(1);
+        let whole = parts.len() == 1 && parts[0] == (0, None);
+        return parts
+            .iter()
+            .enumerate()
+            .map(|(i, &(lo, hi))| WorkItem {
+                job: job_idx,
+                part: i as u32,
+                range: if whole { None } else { Some((lo, hi)) },
+                weight: w,
+            })
+            .collect();
+    }
+    let items = split_items(job_idx, job, opts, src_version);
+    if let Some(r) = resume {
+        let parts: Vec<Part> = items.iter().map(|i| i.range.unwrap_or((0, None))).collect();
+        r.store.plan(&job.table, &parts);
+    }
+    items
 }
 
 /// Stream one COPY from `src` into `tgt`. Returns rows written.
@@ -201,6 +250,19 @@ pub(crate) async fn pipe_copy(
     progress: &TableProgress,
     cancel: &CancellationToken,
 ) -> Result<u64> {
+    pipe_copy_counted(src, tgt, out_sql, in_sql, progress, &AtomicU64::new(0), cancel).await
+}
+
+/// Like [`pipe_copy`], also counting the bytes of this stream in `item_bytes`.
+async fn pipe_copy_counted(
+    src: &Client,
+    tgt: &Client,
+    out_sql: &str,
+    in_sql: &str,
+    progress: &TableProgress,
+    item_bytes: &AtomicU64,
+    cancel: &CancellationToken,
+) -> Result<u64> {
     let fut = async {
         let sink = tgt.copy_in::<_, Bytes>(in_sql).await.sql(in_sql)?;
         let stream = src.copy_out(out_sql).await.sql(out_sql)?;
@@ -208,6 +270,7 @@ pub(crate) async fn pipe_copy(
         futures_util::pin_mut!(stream);
         let mut counted = stream.as_mut().inspect_ok(|b| {
             progress.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+            item_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
         });
         sink.as_mut().send_all(&mut counted).await.map_err(|e| Error::from_pg(e, Some(out_sql)))?;
         sink.as_mut().finish().await.sql(in_sql)
@@ -234,9 +297,26 @@ struct Shared<'a> {
     cancel: CancellationToken,
     log: &'a LogFn,
     queue: Mutex<VecDeque<WorkItem>>,
+    resume: Option<&'a Resume<'a>>,
+    /// Marker rows are written on the target in the same transaction as each part.
+    markers: bool,
 }
 
-async fn run_item(src: &Client, tgt: &Client, item: &WorkItem, sh: &Shared<'_>) -> Result<u64> {
+fn marker_sql(job_id: &str, table: &QName, part: u32, rows: u64, bytes: u64) -> String {
+    format!(
+        "INSERT INTO {CHECKPOINT_SCHEMA}.copy_ckpt (job, tbl, part, rows, bytes) VALUES ({}, {}, {part}, {rows}, {bytes}) ON CONFLICT DO NOTHING",
+        quote_literal(job_id),
+        quote_literal(&marker_key(table))
+    )
+}
+
+/// Unambiguous table key for marker rows (schema and name separated by a NUL-free delimiter).
+fn marker_key(table: &QName) -> String {
+    format!("{}\u{1f}{}", table.schema, table.name)
+}
+
+/// Copy one work item. Returns `(rows, bytes)`.
+async fn run_item(src: &Client, tgt: &Client, item: &WorkItem, sh: &Shared<'_>) -> Result<(u64, u64)> {
     let job = &sh.jobs[item.job];
     let mut begin = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;".to_string();
     if let Some(s) = &sh.snapshot {
@@ -246,7 +326,7 @@ async fn run_item(src: &Client, tgt: &Client, item: &WorkItem, sh: &Shared<'_>) 
     let result = async {
         if sh.opts.mode == CopyMode::Sync && !job.pk.is_empty() {
             let c = super::sync::sync_table(src, tgt, job, None, &sh.cancel).await?;
-            Ok(c.inserted + c.updated)
+            Ok((c.inserted + c.updated, 0))
         } else {
             tgt.batch_execute("BEGIN").await.sql("BEGIN")?;
             let filter = item.range.map(|(lo, hi)| match hi {
@@ -254,16 +334,24 @@ async fn run_item(src: &Client, tgt: &Client, item: &WorkItem, sh: &Shared<'_>) 
                 None => format!("ctid >= '({lo},0)'::tid"),
             });
             let (out_sql, in_sql) = copy_sql(&job.table, &job.columns, job.binary, filter.as_deref());
-            match pipe_copy(src, tgt, &out_sql, &in_sql, &job.progress, &sh.cancel).await {
-                Ok(rows) => {
-                    tgt.batch_execute("COMMIT").await.sql("COMMIT")?;
-                    Ok(rows)
+            let item_bytes = AtomicU64::new(0);
+            let r = async {
+                let rows = pipe_copy_counted(src, tgt, &out_sql, &in_sql, &job.progress, &item_bytes, &sh.cancel).await?;
+                let bytes = item_bytes.load(Ordering::Relaxed);
+                if let (Some(res), true) = (sh.resume, sh.markers) {
+                    let m = marker_sql(&res.job_id, &job.table, item.part, rows, bytes);
+                    tgt.batch_execute(&m).await.sql(&m)?;
                 }
-                Err(e) => {
-                    let _ = tgt.batch_execute("ROLLBACK").await;
-                    Err(e)
-                }
+                tgt.batch_execute("COMMIT").await.sql("COMMIT")?;
+                Ok((rows, bytes))
             }
+            .await;
+            if r.is_err() {
+                let _ = tgt.batch_execute("ROLLBACK").await;
+                // Rolled back: these bytes did not land.
+                job.progress.bytes.fetch_sub(item_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            r
         }
     }
     .await;
@@ -280,6 +368,61 @@ pub async fn run(
     opts: &CopyOptions,
     cancel: &CancellationToken,
     log: &LogFn,
+) -> Result<CopySummary> {
+    run_with(source, target, jobs, src_version, opts, cancel, log, None).await
+}
+
+/// Ensure the marker table exists and merge committed markers into the checkpoint store.
+async fn load_markers(admin: &Client, res: &Resume<'_>, jobs: &[TableJob]) -> Result<()> {
+    let ddl = format!(
+        "CREATE SCHEMA IF NOT EXISTS {s}; CREATE TABLE IF NOT EXISTS {s}.copy_ckpt (\
+         job text NOT NULL, tbl text NOT NULL, part int NOT NULL, rows bigint NOT NULL, bytes bigint NOT NULL, \
+         PRIMARY KEY (job, tbl, part))",
+        s = CHECKPOINT_SCHEMA
+    );
+    admin.batch_execute(&ddl).await.sql(&ddl)?;
+    let q = format!(
+        "SELECT tbl, part, rows, bytes FROM {CHECKPOINT_SCHEMA}.copy_ckpt WHERE job = {}",
+        quote_literal(&res.job_id)
+    );
+    let by_key: BTreeMap<String, &QName> = jobs.iter().map(|j| (marker_key(&j.table), &j.table)).collect();
+    for r in simple_rows(admin, &q).await? {
+        let Some(t) = r.get("tbl").and_then(|k| by_key.get(k)) else { continue };
+        let num = |c: &str| r.get(c).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        res.store.mark_done(t, num("part") as u32, num("rows"), num("bytes"));
+    }
+    Ok(())
+}
+
+/// Remove the resume markers of `job_id` from the target (and the marker table once it's empty).
+pub async fn clear_checkpoint(target: &ConnParams, job_id: &str) -> Result<()> {
+    let c = connect(target, &SessionOptions::data(Side::Target)).await?;
+    let del = format!("DELETE FROM {CHECKPOINT_SCHEMA}.copy_ckpt WHERE job = {}", quote_literal(job_id));
+    if c.batch_execute(&del).await.is_err() {
+        return Ok(()); // no marker table
+    }
+    let left = simple_rows(&c, &format!("SELECT count(*) AS n FROM {CHECKPOINT_SCHEMA}.copy_ckpt")).await?;
+    if left.first().and_then(|r| r.get("n")) == Some("0") {
+        let _ = c
+            .batch_execute(&format!("DROP TABLE {s}.copy_ckpt; DROP SCHEMA IF EXISTS {s}", s = CHECKPOINT_SCHEMA))
+            .await;
+    }
+    Ok(())
+}
+
+/// [`run`] with optional resume support: committed parts are skipped, and each part's commit is
+/// recorded in `resume.store` and — when the user may create the marker table — atomically on the
+/// target, so a crash between commit and checkpoint can't duplicate rows.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with(
+    source: &ConnParams,
+    target: &ConnParams,
+    jobs: &[TableJob],
+    src_version: i32,
+    opts: &CopyOptions,
+    cancel: &CancellationToken,
+    log: &LogFn,
+    resume: Option<&Resume<'_>>,
 ) -> Result<CopySummary> {
     let t0 = Instant::now();
     let mut summary = CopySummary::default();
@@ -325,10 +468,54 @@ pub async fn run(
         summary.warnings.push(w);
     }
 
+    let mut markers = false;
+    if let Some(res) = resume {
+        match load_markers(&admin, res, jobs).await {
+            Ok(()) => markers = true,
+            Err(e) => {
+                let w = format!("resume markers unavailable on target ({e}); resume relies on the local checkpoint");
+                log(Level::Warn, w.clone());
+                summary.warnings.push(w);
+            }
+        }
+    }
+
+    // Plan every table's parts once; restore committed parts from the checkpoint.
+    let mut planned: Vec<Vec<WorkItem>> = Vec::with_capacity(jobs.len());
+    let mut resumed = vec![false; jobs.len()];
+    for (i, j) in jobs.iter().enumerate() {
+        let mut items = plan_items(i, j, opts, src_version, resume);
+        j.progress.parts_total.store(items.len() as u32, Ordering::Relaxed);
+        if let Some(res) = resume {
+            let done = res.store.done(&j.table);
+            if !done.is_empty() {
+                resumed[i] = true;
+                let p = &j.progress;
+                for &(_, rows, bytes) in &done {
+                    p.rows.fetch_add(rows, Ordering::Relaxed);
+                    p.bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                p.parts_done.store(done.len() as u32, Ordering::Relaxed);
+                items.retain(|it| !done.iter().any(|d| d.0 == it.part));
+                if items.is_empty() {
+                    p.mark_running();
+                    p.finish(state::DONE, None);
+                }
+            }
+        }
+        planned.push(items);
+    }
+    let n_resumed = resumed.iter().filter(|r| **r).count();
+    if n_resumed > 0 {
+        log(Level::Info, format!("resuming: {n_resumed} table(s) already have committed parts"));
+    }
+
+    // Tables with committed parts keep their rows; everything else starts clean.
     let truncate: Vec<String> = jobs
         .iter()
-        .filter(|j| opts.mode == CopyMode::Replace || (opts.mode == CopyMode::Sync && j.pk.is_empty()))
-        .map(|j| j.table.sql())
+        .enumerate()
+        .filter(|(i, j)| !resumed[*i] && (opts.mode == CopyMode::Replace || (opts.mode == CopyMode::Sync && j.pk.is_empty())))
+        .map(|(_, j)| j.table.sql())
         .collect();
     if !truncate.is_empty() {
         let sql = format!("TRUNCATE {}", truncate.join(", "));
@@ -347,11 +534,13 @@ pub async fn run(
         cancel: run_cancel.clone(),
         log,
         queue: Mutex::new(VecDeque::new()),
+        resume,
+        markers,
     };
 
     // Open worker connection pairs once.
-    let total_items: usize = jobs.iter().enumerate().map(|(i, j)| split_items(i, j, opts, src_version).len()).sum();
-    let n = workers_n.min(total_items).max(1);
+    let total_items: usize = planned.iter().map(Vec::len).sum();
+    let n = workers_n.min(total_items);
     log(Level::Info, format!("opening {n} worker connection pair(s)"));
     let mut opening = Vec::with_capacity(n);
     for _ in 0..n {
@@ -365,9 +554,10 @@ pub async fn run(
         }
         let mut items: Vec<WorkItem> = Vec::new();
         for &ji in wave {
-            let its = split_items(ji, &jobs[ji], opts, src_version);
-            jobs[ji].progress.parts_total.store(its.len() as u32, Ordering::Relaxed);
-            items.extend(its);
+            items.extend(std::mem::take(&mut planned[ji]));
+        }
+        if items.is_empty() {
+            continue;
         }
         items.sort_by_key(|i| std::cmp::Reverse(i.weight)); // LPT scheduling
         if wave_list.len() > 1 {
@@ -451,7 +641,10 @@ async fn worker_ref(src: &Client, tgt: &Client, sh: &Shared<'_>) {
         }
         p.mark_running();
         match run_item(src, tgt, &item, sh).await {
-            Ok(rows) => {
+            Ok((rows, bytes)) => {
+                if let Some(res) = sh.resume {
+                    res.store.mark_done(&job.table, item.part, rows, bytes);
+                }
                 p.rows.fetch_add(rows, Ordering::Relaxed);
                 let done = p.parts_done.fetch_add(1, Ordering::Relaxed) + 1;
                 if done >= p.parts_total.load(Ordering::Relaxed) && p.state() == state::RUNNING {

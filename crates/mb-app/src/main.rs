@@ -1,19 +1,32 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod jobs;
+#[cfg(debug_assertions)]
+mod shot;
 mod sql_highlight;
 mod store;
 mod theme;
 mod views;
+mod worker;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    // Prefer the platform-native GPU API. Some Vulkan drivers (notably older Intel ones on Windows)
-    // crash during device creation; DX12 / Metal are the most robust choices. Respect a user override.
-    if std::env::var_os("WGPU_BACKEND").is_none() {
+    // Headless background run of a data migration (started by the app, outlives the window).
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(jobs::ARG) {
+        let code = args.next().map(|id| worker::main(&id)).unwrap_or(2);
+        std::process::exit(code);
+    }
+
+    // Renderer: on Windows the GL backend uses a fraction of DX12's memory (~25 MB vs ~290 MB
+    // private) for this UI; if GL can't start we relaunch on DX12. Vulkan is avoided because some
+    // drivers crash during device creation. A user-set WGPU_BACKEND always wins.
+    let ours = std::env::var_os("WGPU_BACKEND").is_none();
+    if ours {
         let backend = if cfg!(windows) {
-            Some("dx12")
+            Some("gl")
         } else if cfg!(target_os = "macos") {
             Some("metal")
         } else {
@@ -26,10 +39,18 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Migrate Baba — PostgreSQL compare & migrate")
+            .with_title("Ferry")
             .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_min_inner_size([1040.0, 640.0]),
         ..Default::default()
     };
-    eframe::run_native("Migrate Baba", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    let r = eframe::run_native("Ferry", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))));
+    if r.is_err() && ours && cfg!(windows) {
+        if let Ok(exe) = std::env::current_exe() {
+            if std::process::Command::new(exe).env("WGPU_BACKEND", "dx12").spawn().is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    r
 }

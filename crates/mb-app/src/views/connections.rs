@@ -1,357 +1,421 @@
-use eframe::egui::{self, Color32, RichText};
-use mb_core::conn::{ConnParams, Provider, ServerInfo, SslMode};
+//! Connections: the job's Source and Target, each picked from saved connections or entered inline.
+//! Edits save themselves once the field loses focus; passwords go to the OS keychain.
+
+use eframe::egui::{self, RichText};
+use mb_core::conn::{probe_tcp, test_connection, ConnParams, Engine, Provider, SslMode};
 use mb_core::progress::Level;
 
-use crate::app::App;
-use crate::store::{new_id, Profile};
+use crate::app::{App, Event, Screen};
+use crate::store::{Job, Profile, Store};
 use crate::theme;
 
-pub struct ConnectionsView {
-    pub selected: Option<String>,
+pub struct Card {
     pub draft: Profile,
     pub password: String,
+    pub port: String,
+    pub excluded: String,
     pub url: String,
-    pub show_pw: bool,
+    pub dirty: bool,
     pub testing: bool,
-    pub test: Option<Result<ServerInfo, String>>,
-    pub excluded_text: String,
-    pub port_text: String,
+    pub test: Option<Result<String, String>>,
+    pub more: bool,
 }
 
-impl ConnectionsView {
-    pub fn new(profiles: &[Profile]) -> Self {
-        let draft = profiles.first().cloned().unwrap_or_else(|| Profile::new(Provider::Generic));
+impl Default for Card {
+    fn default() -> Self {
+        Self::fresh(Engine::Postgres)
+    }
+}
+
+impl Card {
+    fn fresh(engine: Engine) -> Self {
+        let draft = Profile::new(engine);
         Self {
-            selected: profiles.first().map(|p| p.id.clone()),
-            excluded_text: draft.excluded_schemas.join(", "),
-            port_text: draft.params.port.to_string(),
+            port: draft.params.port.to_string(),
             draft,
             password: String::new(),
+            excluded: String::new(),
             url: String::new(),
-            show_pw: false,
+            dirty: false,
             testing: false,
             test: None,
+            more: false,
         }
     }
 
-    fn load(&mut self, p: &Profile, password: String) {
-        self.selected = Some(p.id.clone());
-        self.draft = p.clone();
-        self.password = password;
-        self.excluded_text = p.excluded_schemas.join(", ");
-        self.port_text = p.params.port.to_string();
-        self.test = None;
-        self.url.clear();
+    fn load(p: &Profile, password: String) -> Self {
+        Self {
+            port: p.params.port.to_string(),
+            excluded: p.excluded_schemas.join(", "),
+            draft: p.clone(),
+            password,
+            ..Self::fresh(p.engine)
+        }
     }
 
     fn params(&self) -> ConnParams {
         let mut p = self.draft.params.clone();
         p.password = self.password.clone();
-        p.port = self.port_text.trim().parse().unwrap_or(5432);
+        p.port = self.port.trim().parse().unwrap_or(self.draft.engine.default_port());
         p
     }
 }
 
+#[derive(Default)]
+pub struct ConnectionsView {
+    pub cards: [Card; 2],
+}
+
+impl ConnectionsView {
+    /// Load both cards from the job's current pair.
+    pub fn reload(&mut self, profiles: &[Profile], job: &Job, store: &Store) {
+        for (i, id) in [&job.source_id, &job.target_id].into_iter().enumerate() {
+            let keep_engine = self.cards[i].draft.engine;
+            self.cards[i] = match id.as_ref().and_then(|id| profiles.iter().find(|p| &p.id == id)) {
+                Some(p) => {
+                    let pw = if p.password_loaded { p.params.password.clone() } else { store.get_password(&p.id).unwrap_or_default() };
+                    Card::load(p, pw)
+                }
+                None => Card::fresh(keep_engine),
+            };
+        }
+    }
+
+    pub fn on_tested(&mut self, profile_id: String, result: Result<String, String>) {
+        for c in &mut self.cards {
+            if c.draft.id == profile_id {
+                c.testing = false;
+                c.test = Some(result.clone());
+            }
+        }
+    }
+}
+
 impl App {
-    pub fn on_test_result(&mut self, profile_id: String, result: Result<ServerInfo, String>) {
-        self.conn_view.testing = false;
-        match &result {
-            Ok(i) => self.log(
-                Level::Info,
-                format!("Connected: PostgreSQL {} · round trip {:.0} ms", i.version, i.latency_ms),
-            ),
-            Err(e) => self.log(Level::Error, format!("Connection test failed: {e}")),
+    pub fn connections_actions(&mut self, ui: &mut egui::Ui) {
+        let problem = self.pair_problem();
+        if theme::primary(ui, problem.is_none(), "Run Doctor  →").clicked() {
+            self.screen = Screen::Doctor;
+            self.run_doctor();
         }
-        if self.conn_view.draft.id == profile_id {
-            self.conn_view.test = Some(result);
+        if let Some(p) = problem {
+            theme::muted(ui, p);
         }
     }
 
-    fn select_profile(&mut self, id: &str) {
-        if let Some(p) = self.profiles.iter().find(|p| p.id == id).cloned() {
-            let pw = self.params(&Some(p.id.clone())).map(|c| c.password).unwrap_or_default();
-            self.conn_view.load(&p, pw);
+    fn save_card(&mut self, i: usize) {
+        let c = &mut self.conn.cards[i];
+        c.draft.params.port = c.port.trim().parse().unwrap_or(c.draft.engine.default_port());
+        c.draft.excluded_schemas = c.excluded.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if c.draft.name.trim().is_empty() {
+            c.draft.name = if c.draft.params.database.trim().is_empty() { c.draft.params.host.clone() } else { c.draft.params.database.clone() };
         }
-    }
-
-    fn save_draft(&mut self) {
-        let v = &mut self.conn_view;
-        v.draft.params.port = v.port_text.trim().parse().unwrap_or(5432);
-        v.draft.excluded_schemas =
-            v.excluded_text.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        if v.draft.name.trim().is_empty() {
-            v.draft.name = v.draft.params.display();
-        }
-        let mut p = v.draft.clone();
-        p.params.password = v.password.clone();
+        c.dirty = false;
+        let mut p = c.draft.clone();
+        p.params.password = c.password.clone();
         p.password_loaded = true;
-        let pw = v.password.clone();
+        let pw = c.password.clone();
         let id = p.id.clone();
-        match self.profiles.iter_mut().find(|x| x.id == p.id) {
+        match self.profiles.iter_mut().find(|x| x.id == id) {
             Some(slot) => *slot = p,
             None => self.profiles.push(p),
         }
-        self.conn_view.selected = Some(id.clone());
         if let Err(e) = self.store.set_password(&id, &pw) {
-            self.log(Level::Warn, format!("Could not store the password in the OS keychain ({e}); it is kept for this session only."));
+            self.notify(Level::Warn, format!("Password kept for this session only (keychain: {e})"));
         }
         self.save_profiles();
-        self.notify(format!("Saved connection '{}'", self.conn_view.draft.name));
+        let job = self.job_mut();
+        let slot = if i == 0 { &mut job.source_id } else { &mut job.target_id };
+        if slot.as_deref() != Some(id.as_str()) {
+            *slot = Some(id);
+        }
+        self.save_job();
+        self.cat = None;
+    }
+
+    fn test_card(&mut self, i: usize) {
+        let c = &mut self.conn.cards[i];
+        c.testing = true;
+        c.test = None;
+        let params = c.params();
+        let engine = c.draft.engine;
+        let id = c.draft.id.clone();
+        let bus = self.bus.clone();
+        self.spawn(async move {
+            let result = if engine == Engine::Postgres {
+                test_connection(&params)
+                    .await
+                    .map(|i| format!("PostgreSQL {} · {:.0} ms", i.version.split_whitespace().next().unwrap_or(""), i.latency_ms))
+                    .map_err(|e| e.to_string())
+            } else {
+                probe_tcp(&params.host, params.port, params.connect_timeout_secs)
+                    .await
+                    .map(|ms| format!("Port reachable · {ms:.0} ms"))
+                    .map_err(|e| e.to_string())
+            };
+            bus.send(Event::Tested { profile_id: id, result });
+        });
     }
 
     pub fn ui_connections(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("conn_list").resizable(true).default_size(240.0).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Connections");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("+ New").clicked() {
-                        let p = Profile::new(Provider::Generic);
-                        self.conn_view.load(&p, String::new());
-                        self.conn_view.selected = None;
-                    }
-                });
-            });
-            ui.separator();
-            let mut clicked = None;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for p in &self.profiles {
-                    let sel = self.conn_view.selected.as_deref() == Some(p.id.as_str());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").color(Color32::from_rgb(p.color[0], p.color[1], p.color[2])));
-                        let mut text = RichText::new(p.label());
-                        if p.production {
-                            text = text.color(theme::RED);
-                        }
-                        if ui.selectable_label(sel, text).clicked() {
-                            clicked = Some(p.id.clone());
-                        }
-                    });
-                    ui.label(RichText::new(format!("   {} · {}", p.provider.label(), p.params.host)).small().weak());
-                    ui.add_space(4.0);
-                }
-                if self.profiles.is_empty() {
-                    ui.label(RichText::new("No saved connections yet.\nFill in the form and press Save.").weak());
-                }
-            });
-            if let Some(id) = clicked {
-                self.select_profile(&id);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(860.0);
+            for i in 0..2 {
+                self.connection_card(ui, i);
+                ui.add_space(20.0);
             }
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_max_width(640.0);
-                self.connection_form(ui);
+            // Optional schema scope for the whole job.
+            theme::card(ui, |ui| {
+                theme::section(ui, "Scope", true);
+                ui.add_space(6.0);
+                theme::field_label(ui, "Schemas");
+                let mut s = self.job().schemas.clone();
+                let r = theme::input(ui, &mut s, "All schemas — or e.g. public, sales", ui.available_width());
+                if s != self.job().schemas {
+                    self.job_mut().schemas = s;
+                }
+                if r.lost_focus() {
+                    self.save_job();
+                    self.cat = None;
+                }
             });
+            ui.add_space(12.0);
         });
     }
 
-    fn connection_form(&mut self, ui: &mut egui::Ui) {
-        let is_saved = self.profiles.iter().any(|p| p.id == self.conn_view.draft.id);
-        ui.heading(if is_saved { "Edit connection" } else { "New connection" });
-        ui.add_space(6.0);
+    fn connection_card(&mut self, ui: &mut egui::Ui, i: usize) {
+        let p = theme::pal(ui);
+        let other = self.conn.cards[1 - i].draft.id.clone();
+        let saved_ids: Vec<(String, String)> = self
+            .profiles
+            .iter()
+            .filter(|x| x.engine == self.conn.cards[i].draft.engine)
+            .map(|x| (x.id.clone(), x.label()))
+            .collect();
+        let mut focused = false;
+        let mut pick: Option<Option<String>> = None;
+        let mut test = false;
+        let mut save_now = false;
 
-        // Paste URL
-        ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.conn_view.url)
-                    .hint_text("Paste a connection URL: postgresql://user:pass@host:5432/db?sslmode=require")
-                    .desired_width(470.0),
-            );
-            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Fill from URL").clicked() || enter {
-                match ConnParams::parse_url(&self.conn_view.url) {
-                    Ok(p) => {
-                        let v = &mut self.conn_view;
-                        let provider = Provider::detect(&p.host, p.port);
-                        v.password = p.password.clone();
-                        v.port_text = p.port.to_string();
-                        v.draft.provider = provider;
-                        v.draft.params = ConnParams { password: String::new(), ..p };
-                        if v.excluded_text.trim().is_empty() {
-                            v.excluded_text = provider.excluded_schemas().join(", ");
+        theme::card(ui, |ui| {
+            let c = &mut self.conn.cards[i];
+            let is_saved = saved_ids.iter().any(|(id, _)| *id == c.draft.id);
+            theme::section(ui, if i == 0 { "Source" } else { "Target" }, true);
+            ui.add_space(6.0);
+
+            theme::field_label(ui, "Engine");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 22.0;
+                for e in Engine::ALL {
+                    if theme::radio(ui, c.draft.engine == e, e.label()).clicked() && c.draft.engine != e {
+                        // Switch to the first saved connection of that engine, or a blank one.
+                        pick = Some(self.profiles.iter().find(|x| x.engine == e && x.id != other).map(|x| x.id.clone()));
+                        if pick == Some(None) {
+                            *c = Card::fresh(e);
                         }
-                        v.url.clear(); // never keep the secret in the URL field
                     }
-                    Err(e) => self.log(Level::Error, e.to_string()),
-                }
-            }
-        });
-        ui.add_space(8.0);
-
-        let v = &mut self.conn_view;
-        egui::Grid::new("conn_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Provider");
-            let before = v.draft.provider;
-            egui::ComboBox::from_id_salt("provider").selected_text(v.draft.provider.label()).width(260.0).show_ui(ui, |ui| {
-                for p in Provider::ALL {
-                    ui.selectable_value(&mut v.draft.provider, p, p.label());
                 }
             });
-            if before != v.draft.provider {
-                let p = v.draft.provider;
-                v.draft.params.ssl_mode = p.default_ssl();
-                v.excluded_text = p.excluded_schemas().join(", ");
-                if v.draft.params.database.is_empty() || v.draft.params.database == before.default_database() {
-                    v.draft.params.database = p.default_database().into();
-                }
-            }
-            ui.end_row();
+            ui.add_space(4.0);
 
-            ui.label("Name");
-            ui.add(egui::TextEdit::singleline(&mut v.draft.name).hint_text("e.g. staging").desired_width(360.0));
-            ui.end_row();
+            theme::field_label(ui, "Saved connection");
+            let w = ui.available_width();
+            let selected = if is_saved { c.draft.label() } else { "New connection".to_string() };
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = egui::vec2(12.0, 10.0);
+                egui::ComboBox::from_id_salt(("saved", i)).width(w).selected_text(selected).show_ui(ui, |ui| {
+                    for (id, label) in &saved_ids {
+                        let mut text = RichText::new(label);
+                        if *id == other {
+                            text = text.color(p.faint);
+                        }
+                        if ui.selectable_label(*id == c.draft.id, text).clicked() {
+                            pick = Some(Some(id.clone()));
+                        }
+                    }
+                    if !saved_ids.is_empty() {
+                        ui.separator();
+                    }
+                    if ui.selectable_label(!is_saved, "＋ New connection").clicked() {
+                        pick = Some(None);
+                    }
+                });
+            });
+            ui.add_space(4.0);
 
-            ui.label("Host");
-            ui.add(egui::TextEdit::singleline(&mut v.draft.params.host).hint_text(v.draft.provider.host_hint()).desired_width(360.0));
-            ui.end_row();
-
-            ui.label("Port");
-            ui.add(egui::TextEdit::singleline(&mut v.port_text).desired_width(80.0));
-            ui.end_row();
-
-            ui.label("Database");
-            ui.add(egui::TextEdit::singleline(&mut v.draft.params.database).desired_width(220.0));
-            ui.end_row();
-
-            ui.label("User");
-            ui.add(egui::TextEdit::singleline(&mut v.draft.params.user).desired_width(220.0));
-            ui.end_row();
-
-            ui.label("Password");
+            let gap = 14.0;
+            let full = ui.available_width();
+            let left = (full - gap) * 0.72;
+            let right = full - gap - left;
+            let mut changed = false;
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut v.password).password(!v.show_pw).desired_width(220.0));
-                if ui.small_button(if v.show_pw { "hide" } else { "show" }).clicked() {
-                    v.show_pw = !v.show_pw;
-                }
-                ui.label(RichText::new("stored in OS keychain").small().weak());
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.vertical(|ui| {
+                    ui.set_width(left);
+                    theme::field_label(ui, "Host");
+                    let r = theme::input(ui, &mut c.draft.params.host, "db.example.com", left);
+                    focused |= r.has_focus();
+                    changed |= r.changed();
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(right);
+                    theme::field_label(ui, "Port");
+                    let r = theme::input(ui, &mut c.port, "", right);
+                    focused |= r.has_focus();
+                    changed |= r.changed();
+                });
             });
-            ui.end_row();
-
-            ui.label("SSL mode");
-            egui::ComboBox::from_id_salt("ssl").selected_text(v.draft.params.ssl_mode.as_str()).show_ui(ui, |ui| {
-                for m in SslMode::ALL {
-                    ui.selectable_value(&mut v.draft.params.ssl_mode, m, m.as_str());
-                }
-            });
-            ui.end_row();
-
-            ui.label("Excluded schemas");
-            ui.add(
-                egui::TextEdit::singleline(&mut v.excluded_text)
-                    .hint_text("comma separated, e.g. auth, storage")
-                    .desired_width(360.0),
-            );
-            ui.end_row();
-
-            ui.label("Colour tag");
+            theme::field_label(ui, "Database");
+            let r = theme::input(ui, &mut c.draft.params.database, "", full);
+            focused |= r.has_focus();
+            changed |= r.changed();
+            let half = (full - gap) / 2.0;
             ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut v.draft.color);
-                ui.checkbox(&mut v.draft.production, "Production (extra confirmation for writes)");
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.vertical(|ui| {
+                    ui.set_width(half);
+                    theme::field_label(ui, "User");
+                    let r = theme::input(ui, &mut c.draft.params.user, "", half);
+                    focused |= r.has_focus();
+                    changed |= r.changed();
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(half);
+                    theme::field_label(ui, "Password");
+                    let r = theme::password(ui, &mut c.password, half);
+                    focused |= r.has_focus();
+                    changed |= r.changed();
+                });
             });
-            ui.end_row();
-        });
 
-        for w in self.conn_view.params().warnings() {
-            ui.label(RichText::new(format!("⚠ {w}")).color(theme::AMBER));
-        }
+            if theme::ghost(ui, if c.more { "▾  Fewer options" } else { "▸  More options" }).clicked() {
+                c.more = !c.more;
+            }
+            if c.more {
+                egui::Grid::new(("more", i)).num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+                    theme::field_label(ui, "Name");
+                    let r = theme::input(ui, &mut c.draft.name, "e.g. legacy-mysql", 320.0);
+                    focused |= r.has_focus();
+                    changed |= r.changed();
+                    ui.end_row();
 
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let can = !self.conn_view.draft.params.host.trim().is_empty();
-            if ui.add_enabled(can && !self.conn_view.testing, egui::Button::new("Test connection")).clicked() {
-                self.conn_view.testing = true;
-                self.conn_view.test = None;
-                let p = self.conn_view.params();
-                let id = self.conn_view.draft.id.clone();
-                self.test_profile(p, id);
-            }
-            if self.conn_view.testing {
-                ui.spinner();
-            }
-            if theme::primary_button(ui, can, "Save", false).clicked() {
-                self.save_draft();
-            }
-            let id = Some(self.conn_view.draft.id.clone());
-            if ui.add_enabled(is_saved, egui::Button::new("Use as source")).clicked() {
-                self.source_id = id.clone();
-                self.catalogs = None;
-                self.save_settings();
-                self.notify("Source set");
-            }
-            if ui.add_enabled(is_saved, egui::Button::new("Use as target")).clicked() {
-                self.target_id = id.clone();
-                self.catalogs = None;
-                self.save_settings();
-                self.notify("Target set");
-            }
-            if ui.add_enabled(is_saved, egui::Button::new("Duplicate")).clicked() {
-                let mut p = self.conn_view.draft.clone();
-                p.id = new_id();
-                p.name = format!("{} (copy)", p.name);
-                let pw = self.conn_view.password.clone();
-                self.conn_view.load(&p, pw);
-                self.conn_view.selected = None;
-            }
-            if ui.add_enabled(is_saved, egui::Button::new(RichText::new("Delete").color(theme::RED))).clicked() {
-                let id = self.conn_view.draft.id.clone();
-                self.profiles.retain(|p| p.id != id);
-                self.store.delete_password(&id);
-                if self.source_id.as_deref() == Some(id.as_str()) {
-                    self.source_id = None;
-                }
-                if self.target_id.as_deref() == Some(id.as_str()) {
-                    self.target_id = None;
-                }
-                self.save_profiles();
-                self.save_settings();
-                let next = self.profiles.first().cloned().unwrap_or_else(|| Profile::new(Provider::Generic));
-                self.conn_view.load(&next, String::new());
-                if !self.profiles.is_empty() {
-                    let nid = next.id.clone();
-                    self.select_profile(&nid);
-                }
-            }
-        });
-
-        ui.add_space(10.0);
-        match &self.conn_view.test {
-            Some(Ok(i)) => {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new("✔ Connection OK").color(theme::GREEN).strong());
-                    egui::Grid::new("test_info").num_columns(2).show(ui, |ui| {
-                        ui.label("Server");
-                        ui.label(format!("PostgreSQL {}", i.version));
-                        ui.end_row();
-                        ui.label("Round trip");
-                        ui.label(format!("{:.1} ms (connect {:.0} ms)", i.latency_ms, i.connect_ms));
-                        ui.end_row();
-                        ui.label("User / database");
-                        ui.label(format!("{} / {}", i.current_user, i.database));
-                        ui.end_row();
-                        ui.label("Superuser");
-                        ui.label(if i.is_superuser { "yes" } else { "no" });
-                        ui.end_row();
-                        ui.label("Can disable triggers");
-                        ui.label(if i.can_replica_role {
-                            "yes (fast loads ignore FK order)"
-                        } else {
-                            "no (loads follow foreign-key order)"
+                    if c.draft.engine == Engine::Postgres {
+                        theme::field_label(ui, "Provider");
+                        let before = c.draft.provider;
+                        egui::ComboBox::from_id_salt(("provider", i)).width(320.0).selected_text(c.draft.provider.label()).show_ui(ui, |ui| {
+                            for pv in Provider::ALL {
+                                ui.selectable_value(&mut c.draft.provider, pv, pv.label());
+                            }
                         });
+                        if before != c.draft.provider {
+                            let pv = c.draft.provider;
+                            c.draft.params.ssl_mode = pv.default_ssl();
+                            c.excluded = pv.excluded_schemas().join(", ");
+                            if c.draft.params.database.is_empty() || c.draft.params.database == before.default_database() {
+                                c.draft.params.database = pv.default_database().into();
+                            }
+                            changed = true;
+                        }
                         ui.end_row();
-                    });
-                    if i.version_num > 0 && i.version_num < 120000 {
-                        ui.label(RichText::new("PostgreSQL 12 or newer is required for schema compare.").color(theme::RED));
+
+                        theme::field_label(ui, "SSL");
+                        let before = c.draft.params.ssl_mode;
+                        egui::ComboBox::from_id_salt(("ssl", i)).width(320.0).selected_text(c.draft.params.ssl_mode.as_str()).show_ui(ui, |ui| {
+                            for m in SslMode::ALL {
+                                ui.selectable_value(&mut c.draft.params.ssl_mode, m, m.as_str());
+                            }
+                        });
+                        changed |= before != c.draft.params.ssl_mode;
+                        ui.end_row();
+
+                        theme::field_label(ui, "Skip schemas");
+                        let r = theme::input(ui, &mut c.excluded, "e.g. auth, storage", 320.0);
+                        focused |= r.has_focus();
+                        changed |= r.changed();
+                        ui.end_row();
+
+                        theme::field_label(ui, "From URL");
+                        let r = theme::input(ui, &mut c.url, "postgresql://user:pass@host:5432/db", 320.0);
+                        if r.lost_focus() && !c.url.trim().is_empty() {
+                            match ConnParams::parse_url(&c.url) {
+                                Ok(pp) => {
+                                    let pv = Provider::detect(&pp.host, pp.port);
+                                    c.password = pp.password.clone();
+                                    c.port = pp.port.to_string();
+                                    c.draft.provider = pv;
+                                    c.draft.params = ConnParams { password: String::new(), ..pp };
+                                    if c.excluded.trim().is_empty() {
+                                        c.excluded = pv.excluded_schemas().join(", ");
+                                    }
+                                    changed = true;
+                                }
+                                Err(e) => c.test = Some(Err(e.to_string())),
+                            }
+                            c.url.clear(); // never keep the secret around
+                        }
+                        focused |= r.has_focus();
+                        ui.end_row();
                     }
+
+                    theme::field_label(ui, "Production");
+                    changed |= ui.checkbox(&mut c.draft.production, "Ask for confirmation before writes").changed();
+                    ui.end_row();
                 });
             }
-            Some(Err(e)) => {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new("✖ Connection failed").color(theme::RED).strong());
-                    ui.label(e);
+            if changed {
+                c.dirty = true;
+                c.test = None;
+            }
+
+            ui.add_space(6.0);
+            let can_test = !c.draft.params.host.trim().is_empty() && !c.testing;
+            if theme::wide(ui, can_test, if c.testing { "Testing…" } else { "Test Connection" }).clicked() {
+                test = true;
+                save_now = c.dirty;
+            }
+            match &c.test {
+                Some(Ok(m)) => {
+                    ui.horizontal(|ui| {
+                        theme::dot(ui, p.green);
+                        ui.label(RichText::new(m).color(p.green));
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.horizontal(|ui| {
+                        theme::dot(ui, p.red);
+                        ui.label(RichText::new(e.lines().next().unwrap_or_default()).color(p.red)).on_hover_text(e);
+                    });
+                }
+                None => {}
+            }
+            if c.draft.id == other && is_saved {
+                ui.horizontal(|ui| {
+                    theme::dot(ui, p.amber);
+                    ui.label(RichText::new("Same as the other side — pick a different connection").color(p.amber));
                 });
             }
-            None => {}
+            if c.draft.engine != Engine::Postgres {
+                ui.label(theme::small(format!("{} can be saved and tested; migration support is coming.", c.draft.engine.label())).color(p.muted));
+            }
+        });
+
+        if let Some(choice) = pick {
+            match choice {
+                Some(id) => self.set_side(i == 0, Some(id)),
+                None => {
+                    let engine = self.conn.cards[i].draft.engine;
+                    self.set_side(i == 0, None);
+                    self.conn.cards[i] = Card::fresh(engine);
+                }
+            }
+            return;
+        }
+        let c = &self.conn.cards[i];
+        if (save_now || (c.dirty && !focused)) && !c.draft.params.host.trim().is_empty() {
+            self.save_card(i);
+        }
+        if test {
+            self.test_card(i);
         }
     }
 }
